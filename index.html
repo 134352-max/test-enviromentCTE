@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Cross-Device PeerJS Tag Game</title>
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 100vw; height: 100vh; overflow: hidden;
+      background: #0d0e15; color: #fff;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      touch-action: manipulation; position: relative;
+    }
+    #uiOverlay {
+      position: absolute; top: 25px; left: 50%;
+      transform: translateX(-50%); display: flex;
+      flex-direction: column; align-items: center; gap: 15px;
+      z-index: 10; pointer-events: none;
+    }
+    #uiOverlay * { pointer-events: auto; }
+    #status {
+      font-size: 1rem; font-weight: 700; color: #00ffcc;
+      text-align: center; background: rgba(13, 14, 21, 0.85);
+      border: 1px solid rgba(0, 255, 204, 0.3); padding: 10px 22px;
+      border-radius: 30px; backdrop-filter: blur(8px);
+    }
+    .panel {
+      background: rgba(22, 24, 35, 0.85); backdrop-filter: blur(16px);
+      padding: 20px 25px; border-radius: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      display: flex; flex-direction: column; gap: 12px; align-items: center;
+    }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; }
+    .field-group {
+      display: flex; align-items: center; gap: 6px;
+      background: rgba(0, 0, 0, 0.3); padding: 6px 12px; border-radius: 8px;
+    }
+    input[type="text"], select, button {
+      padding: 10px 14px; font-size: 0.95rem; border-radius: 8px;
+      border: 1px solid #333d4d; outline: none; background: #11141c; color: #fff;
+    }
+    button { background: #007acc; cursor: pointer; font-weight: 700; border: none; }
+    #btnHost { background: #6c5ce7; }
+    #btnJoin { background: #00b894; }
+    #btnStart { background: #28a745; display: none; }
+    canvas { display: block; width: 100vw; height: 100vh; background: #12141d; }
+    .dpad {
+      position: absolute; bottom: 20px; left: 20px;
+      display: none; grid-template-columns: repeat(3, 55px);
+      grid-template-rows: repeat(2, 55px); gap: 5px; z-index: 10;
+    }
+    .dpad button { font-size: 1.4rem; background: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255,255,255,0.2); }
+  </style>
+</head>
+<body>
+
+  <div id="uiOverlay">
+    <div id="status">🎮 Create or Join a Match</div>
+    <div class="panel" id="lobbyPanel">
+      <div id="setupRow" class="row">
+        <input type="text" id="usernameInput" placeholder="Username" value="Player">
+        <div class="field-group">
+          <label>Color</label>
+          <input type="color" id="colorPicker" value="#00ffcc">
+        </div>
+        <input type="text" id="roomInput" placeholder="Room ID Code">
+        <button id="btnHost" type="button">Host Game</button>
+        <button id="btnJoin" type="button">Join Game</button>
+      </div>
+      <div class="row" id="hostControls" style="display: none;">
+        <div class="field-group">
+          <label>Arena Design:</label>
+          <select id="mapSelect">
+            <option value="0">Classic Platforms</option>
+            <option value="1">Multi-Level Towers</option>
+            <option value="2">Center Divide</option>
+          </select>
+        </div>
+        <button id="btnStart" type="button">🚀 Start Game</button>
+      </div>
+    </div>
+  </div>
+
+  <canvas id="gameCanvas"></canvas>
+
+  <div class="dpad" id="dpadControls">
+    <div></div><button id="btnUp">▲</button><div></div>
+    <button id="btnLeft">◀</button><button id="btnDown">▼</button><button id="btnRight">▶</button>
+  </div>
+
+  <script>
+    let peer = null;
+    let conn = null;
+
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const roomInput = document.getElementById('roomInput');
+    const usernameInput = document.getElementById('usernameInput');
+    const colorPicker = document.getElementById('colorPicker');
+    const lobbyPanel = document.getElementById('lobbyPanel');
+    const hostControls = document.getElementById('hostControls');
+    const mapSelect = document.getElementById('mapSelect');
+    const btnStart = document.getElementById('btnStart');
+    const dpadControls = document.getElementById('dpadControls');
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    let role = null; // 'p1' or 'p2'
+    let gameStarted = false;
+    let currentMapIndex = 0;
+    let tagCooldown = 0;
+
+    const radius = 20;
+    const moveSpeed = 6;
+    const gravity = 0.5;
+    const jumpStrength = -12;
+    const keys = {};
+
+    const gameState = {
+      p1: { x: 200, y: 100, vx: 0, vy: 0, isGrounded: false, targetX: 200, targetY: 100, isIt: true, color: '#ff3333', name: 'P1' },
+      p2: { x: 800, y: 100, vx: 0, vy: 0, isGrounded: false, targetX: 800, targetY: 100, isIt: false, color: '#3388ff', name: 'P2' }
+    };
+
+    function getMapPlatforms(index) {
+      const w = canvas.width;
+      const h = canvas.height;
+      const ground = { x: 0, y: h - 40, w: w, h: 40 };
+
+      if (index === 1) {
+        return [
+          ground,
+          { x: w * 0.1, y: h - 160, w: 200, h: 20 },
+          { x: w * 0.1, y: h - 320, w: 180, h: 20 },
+          { x: w * 0.7, y: h - 160, w: 200, h: 20 },
+          { x: w * 0.72, y: h - 320, w: 180, h: 20 },
+          { x: w * 0.35, y: h - 240, w: 250, h: 20 }
+        ];
+      } else if (index === 2) {
+        return [
+          ground,
+          { x: w * 0.15, y: h - 180, w: 220, h: 20 },
+          { x: w * 0.65, y: h - 180, w: 220, h: 20 },
+          { x: w * 0.48 - 10, y: h - 350, w: 20, h: 310 }
+        ];
+      }
+      return [
+        ground,
+        { x: w * 0.15, y: h - 180, w: 220, h: 20 },
+        { x: w * 0.63, y: h - 180, w: 220, h: 20 },
+        { x: w * 0.35, y: h - 320, w: 260, h: 20 }
+      ];
+    }
+
+    // Initialize Host Connection
+    document.getElementById('btnHost').onclick = () => {
+      const roomId = roomInput.value.trim().toLowerCase();
+      if (!roomId) return alert("Enter a Room ID!");
+
+      role = 'p1';
+      gameState.p1.name = usernameInput.value.trim() || 'Host';
+      gameState.p1.color = colorPicker.value;
+
+      peer = new Peer('tag-game-' + roomId);
+
+      peer.on('open', (id) => {
+        statusEl.textContent = `👑 Room Created: [${roomId}]. Waiting for player...`;
+        hostControls.style.display = 'flex';
+        btnStart.style.display = 'inline-block';
+      });
+
+      peer.on('connection', (connection) => {
+        conn = connection;
+        setupConnection();
+        statusEl.textContent = `🤝 Player Connected! Click 'Start Game' to begin.`;
+      });
+
+      peer.on('error', (err) => {
+        if(err.type === 'unavailable-id') alert("Room ID taken! Pick another.");
+      });
+    };
+
+    // Initialize Client Connection
+    document.getElementById('btnJoin').onclick = () => {
+      const roomId = roomInput.value.trim().toLowerCase();
+      if (!roomId) return alert("Enter a Room ID!");
+
+      role = 'p2';
+      gameState.p2.name = usernameInput.value.trim() || 'Guest';
+      gameState.p2.color = colorPicker.value;
+
+      peer = new Peer();
+
+      peer.on('open', () => {
+        statusEl.textContent = `Connecting to ${roomId}...`;
+        conn = peer.connect('tag-game-' + roomId);
+        setupConnection();
+      });
+    };
+
+    function setupConnection() {
+      conn.on('open', () => {
+        if (role === 'p2') statusEl.textContent = `Connected! Waiting for host to start...`;
+        
+        setInterval(() => {
+          if (!conn) return;
+          conn.send({
+            role,
+            x: gameState[role].x,
+            y: gameState[role].y,
+            color: gameState[role].color,
+            name: gameState[role].name,
+            p1IsIt: gameState.p1.isIt,
+            gameStarted,
+            mapIndex: currentMapIndex
+          });
+        }, 1000 / 30);
+      });
+
+      conn.on('data', (data) => {
+        const oppRole = role === 'p1' ? 'p2' : 'p1';
+        gameState[oppRole].targetX = data.x;
+        gameState[oppRole].targetY = data.y;
+        gameState[oppRole].color = data.color;
+        gameState[oppRole].name = data.name;
+        currentMapIndex = data.mapIndex;
+
+        if (data.gameStarted && !gameStarted) {
+          gameStarted = true;
+          lobbyPanel.style.display = 'none';
+          statusEl.textContent = `⚡ GAME ACTIVE!`;
+        }
+
+        if (data.p1IsIt !== undefined) {
+          gameState.p1.isIt = data.p1IsIt;
+          gameState.p2.isIt = !data.p1IsIt;
+        }
+      });
+    }
+
+    btnStart.onclick = () => {
+      if (role === 'p1') {
+        gameStarted = true;
+        lobbyPanel.style.display = 'none';
+        statusEl.textContent = `⚡ GAME ACTIVE!`;
+      }
+    };
+
+    mapSelect.onchange = () => {
+      if (role === 'p1') currentMapIndex = parseInt(mapSelect.value, 10);
+    };
+
+    if ('ontouchstart' in window) dpadControls.style.display = 'grid';
+
+    window.onkeydown = e => keys[e.key] = true;
+    window.onkeyup = e => keys[e.key] = false;
+
+    const bindTouch = (id, key) => {
+      const el = document.getElementById(id);
+      el.ontouchstart = (e) => { e.preventDefault(); keys[key] = true; };
+      el.ontouchend = (e) => { e.preventDefault(); keys[key] = false; };
+    };
+    bindTouch('btnUp', 'ArrowUp');
+    bindTouch('btnLeft', 'ArrowLeft');
+    bindTouch('btnRight', 'ArrowRight');
+
+    function update() {
+      if (!role) return;
+
+      const p = gameState[role];
+      p.vx = 0;
+      if (keys['a'] || keys['A'] || keys['ArrowLeft']) p.vx = -moveSpeed;
+      if (keys['d'] || keys['D'] || keys['ArrowRight']) p.vx = moveSpeed;
+
+      if ((keys['w'] || keys['W'] || keys['ArrowUp'] || keys[' ']) && p.isGrounded) {
+        p.vy = jumpStrength;
+        p.isGrounded = false;
+      }
+
+      p.vy += gravity;
+
+      let nextX = p.x + p.vx;
+      let nextY = p.y + p.vy;
+
+      const platforms = getMapPlatforms(currentMapIndex);
+      p.isGrounded = false;
+
+      for (const plat of platforms) {
+        if (nextX + radius > plat.x && nextX - radius < plat.x + plat.w) {
+          if (p.y + radius <= plat.y && nextY + radius >= plat.y) {
+            nextY = plat.y - radius;
+            p.vy = 0;
+            p.isGrounded = true;
+          } else if (p.y - radius >= plat.y + plat.h && nextY - radius <= plat.y + plat.h) {
+            nextY = plat.y + plat.h + radius;
+            p.vy = 0;
+          }
+        }
+        if (nextY + radius > plat.y && nextY - radius < plat.y + plat.h) {
+          if (p.x + radius <= plat.x && nextX + radius >= plat.x) nextX = plat.x - radius;
+          else if (p.x - radius >= plat.x + plat.w && nextX - radius <= plat.x + plat.w) nextX = plat.x + plat.w + radius;
+        }
+      }
+
+      if (nextX - radius < 0) nextX = radius;
+      if (nextX + radius > canvas.width) nextX = canvas.width - radius;
+
+      p.x = nextX;
+      p.y = nextY;
+
+      // Smooth Position Interpolation
+      const oppRole = role === 'p1' ? 'p2' : 'p1';
+      const opp = gameState[oppRole];
+      opp.x += (opp.targetX - opp.x) * 0.25;
+      opp.y += (opp.targetY - opp.y) * 0.25;
+
+      if (tagCooldown > 0) tagCooldown--;
+
+      if (gameStarted && tagCooldown === 0) {
+        const dx = gameState.p1.x - gameState.p2.x;
+        const dy = gameState.p1.y - gameState.p2.y;
+        if (Math.sqrt(dx * dx + dy * dy) < radius * 2) {
+          gameState.p1.isIt = !gameState.p1.isIt;
+          gameState.p2.isIt = !gameState.p2.isIt;
+          tagCooldown = 60;
+        }
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const platforms = getMapPlatforms(currentMapIndex);
+      ctx.fillStyle = '#262938';
+      ctx.strokeStyle = '#3e435e';
+      ctx.lineWidth = 2;
+      for (const plat of platforms) {
+        ctx.fillRect(plat.x, plat.y, plat.w, plat.h);
+        ctx.strokeRect(plat.x, plat.y, plat.w, plat.h);
+      }
+
+      ['p1', 'p2'].forEach(key => {
+        const p = gameState[key];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 12px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(p.name, p.x, p.y + radius + 14);
+
+        if (gameStarted && p.isIt) {
+          ctx.lineWidth = 4;
+          ctx.strokeStyle = '#ff3333';
+          ctx.stroke();
+          ctx.fillStyle = '#ff3333';
+          ctx.fillText('IT!', p.x, p.y - radius - 8);
+        }
+      });
+    }
+
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+    loop();
+  </script>
+</body>
+</html>
